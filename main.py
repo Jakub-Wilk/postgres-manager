@@ -409,12 +409,8 @@ class PostgresManager:
                                 parts = line_str.split()
                                 table_name = ""
                                 if len(parts) > 2:
-                                    table_name = f" - {parts[-1]}"
-                                self.status_label.text = f"Restoring database... [Created {table_count} tables{table_name}]"
-                                await asyncio.sleep(3)
-                                self.status_label.text = (
-                                    "Restoring database... [Restoring data...]"
-                                )
+                                    table_name = f" - created {parts[-1]}"
+                                self.status_label.text = f"Restoring database... [Created {table_count} tables{table_name}. Continuing...]"
                                 await asyncio.sleep(0.01)
                             elif "restoring data for table" in line_str.lower():
                                 # Extract table name for data restoration
