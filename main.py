@@ -13,6 +13,7 @@ from typing import List
 
 import psycopg
 from nicegui import ui
+from nicegui.element import Element
 
 
 class PostgresManager:
@@ -27,6 +28,8 @@ class PostgresManager:
         self.restore_dropdown = None
         self.clean_db_checkbox = None
         self.status_label = None
+        self.status_footer = None
+        self.loading_overlay: Element | None = None
 
     def load_config(self):
         """Load database connections from config.toml"""
@@ -44,6 +47,36 @@ class PostgresManager:
     def get_connection_names(self) -> List[str]:
         """Get list of connection names"""
         return list(self.connections.keys())
+
+    def is_restore_prevented(self, connection_name: str) -> bool:
+        """Check if restore is prevented for a connection"""
+        if connection_name not in self.connections:
+            return False
+        return self.connections[connection_name].get("prevent_restore", False)
+
+    def reset_status_bar(self):
+        """Reset status bar to normal state"""
+        if self.status_label:
+            self.status_label.text = "Ready"
+        if self.status_footer:
+            self.status_footer.classes(replace="p-4")
+
+    def show_loading_overlay(self):
+        """Show loading overlay with spinner"""
+        if self.loading_overlay:
+            self.loading_overlay.set_visibility(True)
+
+    def hide_loading_overlay(self):
+        """Hide loading overlay"""
+        if self.loading_overlay:
+            self.loading_overlay.set_visibility(False)
+
+    def refresh_dump_name(self):
+        """Refresh dump name with current timestamp"""
+        if self.dump_name_input and self.selected_connection:
+            self.dump_name_input.value = self.generate_dump_name(
+                self.selected_connection
+            )
 
     def get_dump_files(self, connection_name: str) -> List[str]:
         """Get list of dump files for a connection"""
@@ -64,12 +97,9 @@ class PostgresManager:
 
     def generate_dump_name(self, connection_name: str) -> str:
         """Generate default dump name"""
-        if connection_name not in self.connections:
-            return ""
 
-        db_name = self.connections[connection_name].get("dbname", "db")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{db_name}_dump_{timestamp}"
+        return f"{connection_name}_dump_{timestamp}"
 
     async def dump_database(self, connection_name: str, dump_name: str):
         """Dump database using pg_dump"""
@@ -89,7 +119,7 @@ class PostgresManager:
 
         dump_file = dump_path / dump_name
 
-        # Build pg_dump command
+        # Build pg_dump command with verbose output
         cmd = [
             "pg_dump",
             "-h",
@@ -101,6 +131,7 @@ class PostgresManager:
             "-d",
             conn_config.get("dbname"),
             "-Fc",  # Custom format
+            "--verbose",  # Enable verbose output for progress tracking
             "-f",
             str(dump_file),
         ]
@@ -110,8 +141,13 @@ class PostgresManager:
         env["PGPASSWORD"] = conn_config.get("password", "")
 
         try:
-            self.status_label.text = f"Dumping database {conn_config.get('dbname')}..."
+            self.show_loading_overlay()
+            self.status_label.text = (
+                f"Preparing to dump database {conn_config.get('dbname')}..."
+            )
+            await asyncio.sleep(0.1)  # Allow UI to update
 
+            # Start the process
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 env=env,
@@ -119,24 +155,103 @@ class PostgresManager:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            stdout, stderr = await process.communicate()
+            # Monitor progress by reading stderr line by line (pg_dump outputs progress to stderr)
+            stderr_output = []
+            table_count = 0
+            processed_items = 0
+
+            async def read_stderr():
+                nonlocal table_count, processed_items
+                try:
+                    while True:
+                        line = await process.stderr.readline()
+                        if not line:
+                            break
+
+                        line_str = line.decode().strip()
+                        if line_str:  # Only process non-empty lines
+                            stderr_output.append(line_str)
+
+                            # Parse progress from pg_dump verbose output
+                            if "dumping contents of table" in line_str.lower():
+                                table_count += 1
+                                # Extract table name for data dumping
+                                parts = line_str.split('"')
+                                table_name = parts[1] if len(parts) > 1 else "unknown"
+                                self.status_label.text = f"Dumping database... [Exporting data from {table_name}] ({table_count} tables)"
+                                await asyncio.sleep(0.01)
+                            elif "processing item" in line_str.lower():
+                                processed_items += 1
+                                self.status_label.text = f"Dumping database... [Processing item {processed_items}]"
+                                await asyncio.sleep(0.01)
+                            elif "reading schemas" in line_str.lower():
+                                self.status_label.text = (
+                                    "Dumping database... [Reading database schema]"
+                                )
+                                await asyncio.sleep(0.01)
+                            elif "reading extensions" in line_str.lower():
+                                self.status_label.text = (
+                                    "Dumping database... [Reading extensions]"
+                                )
+                                await asyncio.sleep(0.01)
+                            elif "reading types" in line_str.lower():
+                                self.status_label.text = (
+                                    "Dumping database... [Reading custom types]"
+                                )
+                                await asyncio.sleep(0.01)
+                            elif "reading user-defined tables" in line_str.lower():
+                                self.status_label.text = (
+                                    "Dumping database... [Reading table structures]"
+                                )
+                                await asyncio.sleep(0.01)
+                            elif "reading indexes" in line_str.lower():
+                                self.status_label.text = (
+                                    "Dumping database... [Reading indexes]"
+                                )
+                                await asyncio.sleep(0.01)
+                            elif "reading constraints" in line_str.lower():
+                                self.status_label.text = (
+                                    "Dumping database... [Reading constraints]"
+                                )
+                                await asyncio.sleep(0.01)
+                except Exception as e:
+                    print(f"Error reading stderr: {e}")
+
+            # Start reading stderr in background
+            stderr_task = asyncio.create_task(read_stderr())
+
+            # Wait for process to complete (only read stdout, stderr is handled above)
+            await process.stdout.read()  # Consume stdout to prevent blocking
+
+            # Wait for process to finish
+            await process.wait()
+
+            # Wait for stderr reading to complete
+            await stderr_task
 
             if process.returncode == 0:
                 ui.notify(
                     f"Database dumped successfully to {dump_name}", type="positive"
                 )
-                self.status_label.text = f"Dump completed: {dump_name}"
+                self.status_label.text = f"Dump completed: {dump_name} - {table_count} tables exported, {processed_items} items processed"
                 # Refresh dump list if in restore mode
                 if hasattr(self, "restore_dropdown") and self.restore_dropdown:
                     self.refresh_restore_dropdown()
+                # Refresh dump name for next dump
+                self.refresh_dump_name()
             else:
-                error_msg = stderr.decode() if stderr else "Unknown error"
-                ui.notify(f"Dump failed: {error_msg}", type="negative")
-                self.status_label.text = f"Dump failed: {error_msg}"
+                # Join stderr output for error logging
+                full_error = "\n".join(stderr_output)
+                print("Full dump error output:", full_error)
+                ui.notify("Dump failed: Check console for details", type="negative")
+                self.status_label.text = "Dump failed - check console for details"
+
+            self.hide_loading_overlay()
 
         except Exception as e:
             ui.notify(f"Error during dump: {e}", type="negative")
-            self.status_label.text = f"Error: {e}"
+            self.status_label.text = f"Error during dump: {e}"
+            self.hide_loading_overlay()
 
     async def clean_database(self, connection_name: str):
         """Drop all tables in the database"""
@@ -151,6 +266,9 @@ class PostgresManager:
 
             async with await psycopg.AsyncConnection.connect(conn_str) as conn:
                 async with conn.cursor() as cur:
+                    self.status_label.text = "Scanning database tables..."
+                    await asyncio.sleep(0.1)  # Allow UI to update
+
                     # Get all table names
                     await cur.execute("""
                         SELECT tablename FROM pg_tables 
@@ -159,18 +277,42 @@ class PostgresManager:
                     tables = await cur.fetchall()
 
                     if tables:
-                        # Drop all tables
                         table_names = [table[0] for table in tables]
-                        tables_str = ", ".join(f'"{table}"' for table in table_names)
-                        await cur.execute(f"DROP TABLE IF EXISTS {tables_str} CASCADE")
-                        await conn.commit()
+                        total_tables = len(table_names)
 
-                        ui.notify(f"Dropped {len(tables)} tables", type="info")
+                        self.status_label.text = (
+                            f"Found {total_tables} tables to drop..."
+                        )
+                        await asyncio.sleep(0.1)  # Allow UI to update
+
+                        # Drop tables one by one to show progress
+                        for i, table_name in enumerate(table_names, 1):
+                            self.status_label.text = f"Dropping tables... [{i}/{total_tables}] - {table_name}"
+                            await asyncio.sleep(0.05)  # Allow UI to update
+
+                            try:
+                                await cur.execute(
+                                    f'DROP TABLE IF EXISTS "{table_name}" CASCADE'
+                                )
+                                await conn.commit()
+                            except Exception as e:
+                                # Continue with other tables even if one fails
+                                print(
+                                    f"Warning: Failed to drop table {table_name}: {e}"
+                                )
+
+                        self.status_label.text = (
+                            f"Successfully dropped {total_tables} tables"
+                        )
+                        ui.notify(f"Dropped {total_tables} tables", type="info")
+                    else:
+                        self.status_label.text = "No tables found to drop"
 
             return True
 
         except Exception as e:
             ui.notify(f"Error cleaning database: {e}", type="negative")
+            self.status_label.text = f"Error cleaning database: {e}"
             return False
 
     async def restore_database(
@@ -190,18 +332,22 @@ class PostgresManager:
             return
 
         try:
+            self.show_loading_overlay()
             self.status_label.text = (
-                f"Restoring database {conn_config.get('dbname')}..."
+                f"Preparing to restore database {conn_config.get('dbname')}..."
             )
+            await asyncio.sleep(0.1)  # Allow UI to update
 
             # Clean database if requested
             if clean_db:
-                self.status_label.text = "Cleaning database..."
+                self.status_label.text = "Cleaning database before restore..."
+                await asyncio.sleep(0.1)  # Allow UI to update
                 success = await self.clean_database(connection_name)
                 if not success:
+                    self.hide_loading_overlay()
                     return
 
-            # Build pg_restore command
+            # Build pg_restore command with verbose output
             cmd = [
                 "pg_restore",
                 "-h",
@@ -214,6 +360,7 @@ class PostgresManager:
                 conn_config.get("dbname"),
                 "--no-owner",
                 "--no-privileges",
+                "--verbose",  # Enable verbose output for progress tracking
                 str(dump_file_path),
             ]
 
@@ -221,6 +368,10 @@ class PostgresManager:
             env = os.environ.copy()
             env["PGPASSWORD"] = conn_config.get("password", "")
 
+            self.status_label.text = "Starting database restore..."
+            await asyncio.sleep(0.1)  # Allow UI to update
+
+            # Start the process
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 env=env,
@@ -228,25 +379,88 @@ class PostgresManager:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            stdout, stderr = await process.communicate()
+            # Monitor progress by reading stderr line by line (pg_restore outputs progress to stderr)
+            stderr_output = []
+            table_count = 0
+            processed_items = 0
+
+            async def read_stderr():
+                nonlocal table_count, processed_items
+                try:
+                    while True:
+                        line = await process.stderr.readline()
+                        if not line:
+                            break
+
+                        line_str = line.decode().strip()
+                        if line_str:  # Only process non-empty lines
+                            stderr_output.append(line_str)
+
+                            # Parse progress from pg_restore verbose output
+                            if "processing item" in line_str.lower():
+                                processed_items += 1
+                                self.status_label.text = f"Restoring database... [Processing item {processed_items}]"
+                                await asyncio.sleep(
+                                    0.01
+                                )  # Small delay to allow UI updates
+                            elif "creating table" in line_str.lower():
+                                table_count += 1
+                                # Extract table name if possible
+                                parts = line_str.split()
+                                table_name = ""
+                                if len(parts) > 2:
+                                    table_name = f" - {parts[-1]}"
+                                self.status_label.text = f"Restoring database... [Created {table_count} tables{table_name}]"
+                                await asyncio.sleep(3)
+                                self.status_label.text = (
+                                    "Restoring database... [Restoring data...]"
+                                )
+                                await asyncio.sleep(0.01)
+                            elif "restoring data for table" in line_str.lower():
+                                # Extract table name for data restoration
+                                parts = line_str.split('"')
+                                table_name = parts[1] if len(parts) > 1 else "unknown"
+                                self.status_label.text = f"Restoring database... [Loading data into {table_name}]"
+                                await asyncio.sleep(0.01)
+                            elif "creating index" in line_str.lower():
+                                self.status_label.text = "Restoring database... [Creating indexes and constraints]"
+                                await asyncio.sleep(0.01)
+                except Exception as e:
+                    print(f"Error reading stderr: {e}")
+
+            # Start reading stderr in background
+            stderr_task = asyncio.create_task(read_stderr())
+
+            # Wait for process to complete (only read stdout, stderr is handled above)
+            await process.stdout.read()  # Consume stdout to prevent blocking
+
+            # Wait for process to finish
+            await process.wait()
+
+            # Wait for stderr reading to complete
+            await stderr_task
 
             if process.returncode == 0:
                 ui.notify(
                     f"Database restored successfully from {dump_file}", type="positive"
                 )
-                self.status_label.text = f"Restore completed from {dump_file}"
+                self.status_label.text = f"Restore completed from {dump_file} - {table_count} tables, {processed_items} items processed"
                 # Reset clean checkbox
                 if self.clean_db_checkbox:
                     self.clean_db_checkbox.value = False
             else:
-                error_msg = stderr.decode() if stderr else "Unknown error"
-                print(error_msg)
-                ui.notify("Restore failed: Error logged", type="negative")
-                self.status_label.text = "Restore failed"
+                # Join stderr output for error logging
+                full_error = "\n".join(stderr_output)
+                print("Full restore error output:", full_error)
+                ui.notify("Restore failed: Check console for details", type="negative")
+                self.status_label.text = "Restore failed - check console for details"
+
+            self.hide_loading_overlay()
 
         except Exception as e:
             ui.notify(f"Error during restore: {e}", type="negative")
-            self.status_label.text = f"Error: {e}"
+            self.status_label.text = f"Error during restore: {e}"
+            self.hide_loading_overlay()
 
     def refresh_restore_dropdown(self):
         """Refresh the restore dropdown with current dump files"""
@@ -334,25 +548,70 @@ def create_restore_ui():
         manager.restore_dropdown = restore_dropdown
 
         # Clean DB checkbox
-        clean_db_checkbox = ui.checkbox("Clean DB", value=False).classes("mb-4")
+        clean_db_checkbox = ui.checkbox(
+            "Clean DB (Drops all tables)", value=False
+        ).classes("mb-4")
         manager.clean_db_checkbox = clean_db_checkbox
 
-        def update_restore_files():
+        # Restore button
+        restore_button = ui.button("Restore Database").classes(
+            "w-full bg-green-600 text-white"
+        )
+
+        def update_restore_ui():
             if connection_select.value:
                 manager.selected_connection = connection_select.value
-                dump_files = manager.get_dump_files(connection_select.value)
-                restore_dropdown.options = dump_files
-                restore_dropdown.value = dump_files[0] if dump_files else None
 
-        connection_select.on("update:model-value", lambda: update_restore_files())
+                # Check if restore is prevented for this connection
+                if manager.is_restore_prevented(connection_select.value):
+                    # Disable all restore controls
+                    restore_dropdown.disable()
+                    clean_db_checkbox.disable()
+                    restore_button.disable()
 
-        # Initialize restore files
-        update_restore_files()
+                    # Clear dropdown and checkbox
+                    restore_dropdown.options = []
+                    restore_dropdown.value = None
+                    clean_db_checkbox.value = False
 
-        # Restore button
+                    # Update status to show error
+                    if manager.status_label:
+                        manager.status_label.text = (
+                            "Restore disabled for this connection"
+                        )
+                    if manager.status_footer:
+                        manager.status_footer.classes(
+                            replace="p-4 bg-red-500 text-white"
+                        )
+                else:
+                    # Enable all restore controls
+                    restore_dropdown.enable()
+                    clean_db_checkbox.enable()
+                    restore_button.enable()
+
+                    # Load dump files
+                    dump_files = manager.get_dump_files(connection_select.value)
+                    restore_dropdown.options = dump_files
+                    restore_dropdown.value = dump_files[0] if dump_files else None
+
+                    # Reset status
+                    if manager.status_label:
+                        manager.status_label.text = "Ready"
+                    if manager.status_footer:
+                        manager.status_footer.classes(replace="p-4")
+
+        connection_select.on("update:model-value", lambda: update_restore_ui())
+
+        # Initialize restore UI state
+        update_restore_ui()
+
+        # Restore button click handler
         async def do_restore():
             if not connection_select.value:
                 ui.notify("Please select a connection", type="warning")
+                return
+            if manager.is_restore_prevented(connection_select.value):
+                ui.notify("Restore is disabled for this connection", type="negative")
                 return
             if not restore_dropdown.value:
                 ui.notify("Please select a dump file", type="warning")
@@ -362,9 +621,7 @@ def create_restore_ui():
                 connection_select.value, restore_dropdown.value, clean_db_checkbox.value
             )
 
-        ui.button("Restore Database", on_click=do_restore).classes(
-            "w-full bg-green-600 text-white"
-        )
+        restore_button.on_click(do_restore)
 
 
 @ui.page("/")
@@ -375,22 +632,67 @@ def main_page():
     with ui.header().classes("bg-gray-800 text-white"):
         ui.label("PostgreSQL Database Manager").classes("text-xl font-bold")
 
-    with ui.row().classes("w-full justify-center p-8"):
+    with ui.column().classes("w-full items-center p-8"):
         # Mode tabs
-        with ui.tabs().classes("w-full max-w-4xl") as tabs:
+        with ui.tabs().classes("w-full max-w-md") as tabs:
             dump_tab = ui.tab("Dump")
             restore_tab = ui.tab("Restore")
 
-        with ui.tab_panels(tabs, value=dump_tab).classes("w-full max-w-4xl"):
-            with ui.tab_panel(dump_tab):
+        # Add tab change handler to reset status
+        def on_tab_change():
+            if tabs.value == dump_tab.label:
+                manager.reset_status_bar()
+                # Refresh dump name with current timestamp when switching to dump mode
+                manager.refresh_dump_name()
+            elif tabs.value == restore_tab.label:
+                # When switching to restore tab, check current connection status
+                if (
+                    hasattr(manager, "selected_connection")
+                    and manager.selected_connection
+                ):
+                    if manager.is_restore_prevented(manager.selected_connection):
+                        if manager.status_label:
+                            manager.status_label.text = (
+                                "Restore disabled for this connection"
+                            )
+                        if manager.status_footer:
+                            manager.status_footer.classes(
+                                replace="p-4 bg-red-500 text-white"
+                            )
+                    else:
+                        manager.reset_status_bar()
+                else:
+                    manager.reset_status_bar()
+
+        tabs.on("update:model-value", lambda: on_tab_change())
+
+        with ui.tab_panels(tabs, value=dump_tab).classes("w-full max-w-xl p-6"):
+            with ui.tab_panel(dump_tab).classes("flex items-center"):
                 create_dump_ui()
 
-            with ui.tab_panel(restore_tab):
+            with ui.tab_panel(restore_tab).classes("flex items-center"):
                 create_restore_ui()
 
     # Status bar
-    with ui.footer().classes("p-4"):
+    status_footer = ui.footer().classes("p-4")
+    with status_footer:
         manager.status_label = ui.label("Ready").classes("text-sm")
+
+    # Store reference to footer for background color changes
+    manager.status_footer = status_footer
+
+    loading_overlay = ui.element("div").classes(
+        "fixed inset-0 bg-black/80 flex items-center justify-center z-50"
+    )
+
+    loading_overlay.set_visibility(False)
+
+    # Loading overlay (initially hidden)
+    with loading_overlay:
+        ui.spinner("dots", size="xl", color="white")
+
+    # Store reference to loading overlay
+    manager.loading_overlay = loading_overlay
 
 
 def main():
@@ -406,6 +708,7 @@ dbname = "database_name"
 user = "username"
 password = "password"
 dump_path = "/path/to/dump/directory"
+prevent_restore = true # optional
         """)
         return
 
@@ -422,5 +725,5 @@ dump_path = "/path/to/dump/directory"
     )
 
 
-if __name__ == "__main__":
+if __name__ in ["__main__", "__mp_main__"]:
     main()

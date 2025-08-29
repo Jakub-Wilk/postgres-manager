@@ -5,7 +5,7 @@
 Create a TOML file (default: `config.toml` in the same directory) with:
 
 ```toml
-[connections.main]
+[connections.main] # "main" is the connection name here, you can set it to anything
 host = "127.0.0.1"
 port = 5432
 dbname = "mydb"
@@ -20,6 +20,7 @@ dbname = "analytics"
 user = "postgres"
 password = "secret"
 dump_path = "./dumps/analytics"
+prevent_restore = true # completely disables restore for this connection
 ```
 
 ## Notes
