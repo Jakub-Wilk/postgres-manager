@@ -1,7 +1,10 @@
 [project]
 name = "postgres-manager"
 version = "0.3.0"
-description = "Add your description here"
+description = "Simple GUI for easily running basic Postgres dump and restore"
+authors = [
+    { name = "Jakub Wilk", email = "wilkjakub64@gmail.com" }
+]
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
