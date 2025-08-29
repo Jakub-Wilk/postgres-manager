@@ -669,6 +669,93 @@ def main_page():
             with ui.tab_panel(restore_tab).classes("flex items-center"):
                 create_restore_ui()
 
+        # Open dump folder button
+        def open_dump_folder():
+            if manager.selected_connection:
+                conn_config = manager.connections[manager.selected_connection]
+                dump_path = Path(conn_config.get("dump_path", ".")).expanduser()
+
+                # Ensure the directory exists
+                dump_path.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    import platform
+                    import subprocess
+
+                    def is_wsl():
+                        """Check if running in WSL (Windows Subsystem for Linux)"""
+                        try:
+                            with open("/proc/version", "r") as f:
+                                content = f.read().lower()
+                                return "microsoft" in content or "wsl" in content
+                        except Exception:
+                            return False
+
+                    def convert_wsl_path_to_windows(linux_path):
+                        """Convert WSL Linux path to Windows path"""
+                        try:
+                            # Use wslpath command to convert Linux path to Windows path
+                            result = subprocess.run(
+                                ["wslpath", "-w", str(linux_path)],
+                                capture_output=True,
+                                text=True,
+                                check=True,
+                            )
+                            return result.stdout.strip()
+                        except Exception:
+                            # Fallback: manual conversion for common cases
+                            path_str = str(linux_path)
+                            if path_str.startswith("/mnt/"):
+                                # /mnt/c/Users/... -> C:\Users\...
+                                parts = path_str.split("/")
+                                if len(parts) >= 3:
+                                    drive = parts[2].upper()
+                                    rest = "/".join(parts[3:])
+                                    return f"{drive}:\\{rest.replace('/', '\\')}"
+                            elif path_str.startswith("/home/"):
+                                # /home/user/... -> \\wsl$\Ubuntu\home\user\...
+                                return f"\\\\wsl$\\Ubuntu{path_str.replace('/', '\\')}"
+                            return path_str
+
+                    # Determine how to open file manager based on OS and WSL
+                    if is_wsl():
+                        # Running in WSL - use Windows explorer with converted path
+                        windows_path = convert_wsl_path_to_windows(dump_path)
+                        # Note: explorer.exe often returns non-zero exit codes in WSL even on success
+                        subprocess.run(["explorer.exe", windows_path])
+                        ui.notify(
+                            f"Opened dump folder in Windows Explorer: {windows_path}",
+                            type="positive",
+                        )
+                    elif platform.system() == "Linux":
+                        # Native Linux
+                        subprocess.run(["xdg-open", str(dump_path)], check=True)
+                        ui.notify(f"Opened dump folder: {dump_path}", type="positive")
+                    elif platform.system() == "Darwin":  # macOS
+                        subprocess.run(["open", str(dump_path)], check=True)
+                        ui.notify(f"Opened dump folder: {dump_path}", type="positive")
+                    elif platform.system() == "Windows":
+                        # Native Windows
+                        subprocess.run(["explorer", str(dump_path)], check=True)
+                        ui.notify(f"Opened dump folder: {dump_path}", type="positive")
+                    else:
+                        ui.notify(
+                            "Unable to open file manager on this platform",
+                            type="warning",
+                        )
+                        return
+
+                except subprocess.CalledProcessError as e:
+                    ui.notify(f"Failed to open dump folder: {e}", type="negative")
+                except Exception as e:
+                    ui.notify(f"Error opening dump folder: {e}", type="negative")
+            else:
+                ui.notify("Please select a connection first", type="warning")
+
+        ui.button("📁 Open Dump Folder", on_click=open_dump_folder).classes(
+            "mt-4 bg-gray-600 hover:bg-gray-700 text-white px-6 py-2 rounded-lg transition-colors"
+        )
+
     # Status bar
     status_footer = ui.footer().classes("p-4")
     with status_footer:
